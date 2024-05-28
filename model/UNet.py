@@ -82,17 +82,3 @@ class UNet(nn.Module):
         output = self.fc(d1) 
 
         return output
-    
-class DeepLabV3Plus(nn.Module):
-    def __init__(self):
-        super(DeepLabV3Plus, self).__init__()
- 
-    def forward(self, input): 
-        return input
-    
-class HRNet(nn.Module):
-    def __init__(self):
-        super(HRNet, self).__init__()
-
-    def forward(self, input): 
-        return input
