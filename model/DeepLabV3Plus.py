@@ -79,11 +79,11 @@ class Decoder(nn.Module):
         return output
 
 class DeepLabV3Plus(nn.Module):
-    def __init__(self, num_classes):
+    def __init__(self, num_classes=1):
         super(DeepLabV3Plus, self).__init__()
         
         # Backbone(Xception)
-        self.backbone = Xception.AlignedXception()
+        self.backbone = Xception.AlignedXception(16, nn.BatchNorm2d)
         
         # Atrous Spatial Pyramid Pooling
         self.aspp = ASPP(2048, 256)
