@@ -39,6 +39,8 @@ class ASPP(nn.Module):
         
         pool = self.pool(input)
 
+        pool = nn.functional.interpolate(pool, size=aspp4.size()[2:], mode='bilinear', align_corners=True)
+        
         cat = torch.cat((aspp1, aspp2, aspp3, aspp4, pool), dim=1)
       
         # 1x1 Convolution 적용
@@ -64,7 +66,7 @@ class Decoder(nn.Module):
         self.dropout = nn.Dropout(0.5)
 
     def forward(self, aspp, low_level):
-        aspp = nn.functional.interpolate(aspp, 4, 'bilinear')
+        aspp = nn.functional.interpolate(aspp, scale_factor=4, mode='bilinear')
 
         low_level = self.low_level_conv(low_level)
 
@@ -74,12 +76,12 @@ class Decoder(nn.Module):
 
         dropout = self.dropout(conv)
 
-        output = nn.functional.interpolate(dropout, 4, 'bilinear')
+        output = nn.functional.interpolate(dropout, scale_factor=4, mode='bilinear')
 
         return output
 
 class DeepLabV3Plus(nn.Module):
-    def __init__(self, num_classes=1):
+    def __init__(self, num_classes):
         super(DeepLabV3Plus, self).__init__()
         
         # Backbone(Xception)
