@@ -1,11 +1,49 @@
 import torch
-import torch.nn as nn
-import torch.optim as optim
-import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Dataset
+import torchvision.transforms as transforms
 from PIL import Image
 import os
+import torch.nn as nn
 import numpy as np
+import torchvision.transforms as transforms
+import torch.optim as optim
+
+
+class SatelliteDataset(Dataset):
+    def __init__(self, image_dir, mask_dir, transform=None):
+        self.image_dir = image_dir
+        self.mask_dir = mask_dir
+        self.transform = transform
+        self.images = os.listdir(image_dir)
+        
+    def __len__(self):
+        return len(self.images)
+    
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.image_dir, self.images[idx])
+        mask_path = os.path.join(self.mask_dir, self.images[idx].replace(".tif", "_FGT.tif"))
+        image = Image.open(img_path).convert("RGB")
+        mask = Image.open(mask_path).convert("L")
+
+        if self.transform:
+            image = self.transform(image)
+            mask = self.transform(mask)
+        
+        return image, mask
+
+# 데이터 경로 설정
+image_dir = "C:/Users/s_zmfldlwx/Desktop/2024-1학기/OSSP-1/팀 프로젝트/New_Sample/2.원천데이터/1.항공사진_Fine_512픽셀"
+mask_dir = "C:/Users/s_zmfldlwx/Desktop/2024-1학기/OSSP-1/팀 프로젝트/New_Sample/1.라벨링데이터/1.항공사진_Fine_512픽셀/1.Ground_Truth_Tiff"
+
+# 데이터 전처리
+transform = transforms.Compose([
+    transforms.Resize((512, 512)),
+    transforms.ToTensor()
+])
+
+# 데이터셋과 데이터로더 생성
+dataset = SatelliteDataset(image_dir, mask_dir, transform=transform)
+dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
 
 class UNet(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -95,47 +133,15 @@ class UNet(nn.Module):
 
 # 모델 생성
 in_channels = 3  # RGB 위성 사진
-out_channels = 1  # 그레이스케일 분류 결과
-model = UNet(in_channels, out_channels)
+out_channels = 9  # 9개 클래스
 
-# 모델 요약
-print(model)
+# GPU가 사용 가능한지 확인
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f'Using device: {device}')
 
-class SatelliteDataset(Dataset):
-    def __init__(self, image_dir, mask_dir, transform=None):
-        self.image_dir = image_dir
-        self.mask_dir = mask_dir
-        self.transform = transform
-        self.images = os.listdir(image_dir)
-        
-    def __len__(self):
-        return len(self.images)
-    
-    def __getitem__(self, idx):
-        img_path = os.path.join(self.image_dir, self.images[idx])
-        mask_path = os.path.join(self.mask_dir, self.images[idx])
-        image = Image.open(img_path).convert("RGB")
-        mask = Image.open(mask_path).convert("L")
+# 모델 생성 및 GPU로 이동
+model = UNet(in_channels=3, out_channels=9).to(device)
 
-        if self.transform:
-            image = self.transform(image)
-            mask = self.transform(mask)
-        
-        return image, mask
-
-# 데이터 전처리
-transform = transforms.Compose([
-    transforms.Resize((512, 512)),
-    transforms.ToTensor()
-])
-
-# 데이터셋과 데이터로더 생성
-image_dir = "/path/to/satellite/images"
-mask_dir = "/path/to/masks"
-dataset = SatelliteDataset(image_dir, mask_dir, transform=transform)
-dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
-
-# 손실 함수 및 옵티마이저 정의
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
@@ -145,6 +151,8 @@ for epoch in range(num_epochs):
     model.train()
     running_loss = 0.0
     for images, masks in dataloader:
+        images = images.to(device)
+        masks = masks.squeeze(1).to(device)  # 차원 줄이기
         optimizer.zero_grad()
         outputs = model(images)
         loss = criterion(outputs, masks.long())
@@ -156,33 +164,10 @@ for epoch in range(num_epochs):
 
 print("Training Finished.")
 
-# 학습된 모델을 로드합니다 (이미 학습된 모델 파일이 있는 경우)
-model_path = 'path/to/saved/model.pth'
-model = UNet(in_channels=3, out_channels=1)
-model.load_state_dict(torch.load(model_path))
-model.eval()
+# 디렉토리 확인 및 생성
+save_dir = './../model_dict_save'
+if not os.path.exists(save_dir):
+    os.makedirs(save_dir)
 
-# 입력 이미지 로드 및 전처리
-input_image_path = 'path/to/input/image.png'
-input_image = Image.open(input_image_path).convert('RGB')
-transform = transforms.Compose([
-    transforms.Resize((512, 512)),
-    transforms.ToTensor()
-])
-input_tensor = transform(input_image).unsqueeze(0)  # 배치 차원 추가
-
-# 모델 예측
-with torch.no_grad():
-    output = model(input_tensor)
-    output = output.squeeze(0)  # 배치 차원 제거
-    output = torch.sigmoid(output)  # 활성화 함수 적용 (필요에 따라)
-
-# 결과를 Numpy 배열로 변환하고 정규화
-output_np = output.cpu().numpy()
-output_np = (output_np * 255).astype(np.uint8)  # 정규화 (0-255 스케일)
-
-# 라벨링 결과를 Tiff 이미지로 저장
-output_image = Image.fromarray(output_np[0])  # 1채널 이미지로 변환
-output_image.save('path/to/output/labeled_image.tiff')
-
-print("라벨링 이미지가 저장되었습니다.")
+# 모델 저장
+torch.save(model.state_dict(), os.path.join(save_dir, 'unet_model.pth'))
