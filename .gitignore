@@ -1,3 +1,6 @@
+dataset
+trained
+
 # Byte-compiled  optimized  DLL files
 __pycache__
 .py[cod]
@@ -61,3 +64,4 @@ target
 
 # Notebook Checkpoints
 .ipynb_checkpoints
+dataset/
