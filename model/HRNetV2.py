@@ -247,7 +247,7 @@ blocks_dict = {
 }
 
 
-class HighResolutionNet(nn.Module):
+class HRNetV2(nn.Module):
 
     cfg = {
     'MODEL': {
@@ -291,7 +291,7 @@ class HighResolutionNet(nn.Module):
     }
 
     def __init__(self, **kwargs):
-        super(HighResolutionNet, self).__init__()
+        super(HRNetV2, self).__init__()
 
         self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=2, padding=1,
                                bias=False)
