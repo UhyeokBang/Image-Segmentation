@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
     
 class UNet(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels=3, num_classes=2):
         super(UNet, self).__init__()
 
         def CBR2d(in_channels, out_channels, kernel_size=3, padding=1, stride=1, bias=True):
@@ -50,7 +50,7 @@ class UNet(nn.Module):
         self.upconv1 = UpConvLayer2d(128, 64)
         self.decoder1 = ConvLayer2d(128, 64)
 
-        self.output_conv = nn.Conv2d(64, out_channels, kernel_size=1)
+        self.output_conv = nn.Conv2d(64, num_classes, kernel_size=1)
 
     def forward(self, x):
         e1 = self.encoder1(x)
