@@ -1,551 +1,465 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from torchvision import datasets, transforms
-from tqdm import tqdm
-import os
-from PIL import Image
-
-import os
-import logging
-import functools
-
-import numpy as np
-
-import torch._utils
 import torch.nn.functional as F
 
-BN_MOMENTUM = 0.1
-logger = logging.getLogger(__name__)
+def CBR2d(in_channels, out_channels, kernel_size=3, padding=0, stride=1, bias=True):
+    return nn.Sequential(nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=padding, stride=stride, bias=bias), nn.BatchNorm2d(num_features=out_channels), nn.ReLU())
+     
+def ConvLayer2d(in_channels, out_channels, kernel_size=3, padding=1, stride=1, bias=True):
+    return nn.Sequential(
+        CBR2d(in_channels, out_channels, kernel_size, padding, stride, bias), 
+        CBR2d(out_channels, out_channels, kernel_size, padding, stride, bias)
+    )
 
+class Interpolate(nn.Module):
+    def __init__(self, size, mode='bilinear', align_corners=True):
+        super(Interpolate, self).__init__()
+        self.size = size
+        self.mode = mode
+        self.align_corners = align_corners
 
-def conv3x3(in_planes, out_planes, stride=1):
-    """3x3 convolution with padding"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
-                     padding=1, bias=False)
+        self.func = nn.functional.interpolate
+        
+    def forward(self, x):
+        x = self.func(x, size=self.size, mode=self.mode, align_corners=self.align_corners)
 
+        return x
 
+# Basic Block
 class BasicBlock(nn.Module):
-    expansion = 1
-
-    def __init__(self, inplanes, planes, stride=1, downsample=None):
+    def __init__(self, in_channels):
         super(BasicBlock, self).__init__()
-        self.conv1 = conv3x3(inplanes, planes, stride)
-        self.bn1 = nn.BatchNorm2d(planes, momentum=BN_MOMENTUM)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = conv3x3(planes, planes)
-        self.bn2 = nn.BatchNorm2d(planes, momentum=BN_MOMENTUM)
-        self.downsample = downsample
-        self.stride = stride
+        self.block1 = ConvLayer2d(in_channels, in_channels, padding=1, bias=False)
+        self.block2 = ConvLayer2d(in_channels, in_channels, padding=1, bias=False)
+        self.block3 = ConvLayer2d(in_channels, in_channels, padding=1, bias=False)
+        self.block4 = ConvLayer2d(in_channels, in_channels, padding=1, bias=False)
 
     def forward(self, x):
-        residual = x
-
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
-        out = self.conv2(out)
-        out = self.bn2(out)
-
-        if self.downsample is not None:
-            residual = self.downsample(x)
-
-        out += residual
-        out = self.relu(out)
+        out = self.block1(x)
+        out = self.block2(x)
+        out = self.block3(x)
+        out = self.block4(x)
 
         return out
 
+# Bottleneck Block
+class BottleneckBlock(nn.Module):
+    def __init__(self):
+        super(BottleneckBlock, self).__init__()
 
-class Bottleneck(nn.Module):
-    expansion = 4
-
-    def __init__(self, inplanes, planes, stride=1, downsample=None):
-        super(Bottleneck, self).__init__()
-        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes, momentum=BN_MOMENTUM)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
-                               padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes, momentum=BN_MOMENTUM)
-        self.conv3 = nn.Conv2d(planes, planes * self.expansion, kernel_size=1,
-                               bias=False)
-        self.bn3 = nn.BatchNorm2d(planes * self.expansion,
-                               momentum=BN_MOMENTUM)
-        self.relu = nn.ReLU(inplace=True)
-        self.downsample = downsample
-        self.stride = stride
-
-    def forward(self, x):
-        residual = x
-
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
-        out = self.conv2(out)
-        out = self.bn2(out)
-        out = self.relu(out)
-
-        out = self.conv3(out)
-        out = self.bn3(out)
-
-        if self.downsample is not None:
-            residual = self.downsample(x)
-
-        out += residual
-        out = self.relu(out)
-
-        return out
-
-
-class HighResolutionModule(nn.Module):
-    def __init__(self, num_branches, blocks, num_blocks, num_inchannels,
-                 num_channels, fuse_method, multi_scale_output=True):
-        super(HighResolutionModule, self).__init__()
-        self._check_branches(
-            num_branches, blocks, num_blocks, num_inchannels, num_channels)
-
-        self.num_inchannels = num_inchannels
-        self.fuse_method = fuse_method
-        self.num_branches = num_branches
-
-        self.multi_scale_output = multi_scale_output
-
-        self.branches = self._make_branches(
-            num_branches, blocks, num_blocks, num_channels)
-        self.fuse_layers = self._make_fuse_layers()
-        self.relu = nn.ReLU(False)
-
-    def _check_branches(self, num_branches, blocks, num_blocks,
-                        num_inchannels, num_channels):
-        if num_branches != len(num_blocks):
-            error_msg = 'NUM_BRANCHES({}) <> NUM_BLOCKS({})'.format(
-                num_branches, len(num_blocks))
-            logger.error(error_msg)
-            raise ValueError(error_msg)
-
-        if num_branches != len(num_channels):
-            error_msg = 'NUM_BRANCHES({}) <> NUM_CHANNELS({})'.format(
-                num_branches, len(num_channels))
-            logger.error(error_msg)
-            raise ValueError(error_msg)
-
-        if num_branches != len(num_inchannels):
-            error_msg = 'NUM_BRANCHES({}) <> NUM_INCHANNELS({})'.format(
-                num_branches, len(num_inchannels))
-            logger.error(error_msg)
-            raise ValueError(error_msg)
-
-    def _make_one_branch(self, branch_index, block, num_blocks, num_channels,
-                         stride=1):
-        downsample = None
-        if stride != 1 or \
-           self.num_inchannels[branch_index] != num_channels[branch_index] * block.expansion:
-            downsample = nn.Sequential(
-                nn.Conv2d(self.num_inchannels[branch_index],
-                          num_channels[branch_index] * block.expansion,
-                          kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(num_channels[branch_index] * block.expansion,
-                            momentum=BN_MOMENTUM),
+        def BottleneckConvLayer2d(in_channels, b_channels, out_channels, bias=True):
+            return nn.Sequential(
+                CBR2d(in_channels, b_channels, kernel_size=1, stride=1, bias=bias), 
+                CBR2d(b_channels, b_channels, kernel_size=3, stride=1, padding=1, bias=bias), 
+                CBR2d(b_channels, out_channels, kernel_size=1, stride=1, bias=bias)
             )
+        
+        self.block1 = BottleneckConvLayer2d(256, 64, 256, bias=False)
+        self.block2 = BottleneckConvLayer2d(256, 64, 256, bias=False)
+        self.block3 = BottleneckConvLayer2d(256, 64, 256, bias=False)
 
-        layers = []
-        layers.append(block(self.num_inchannels[branch_index],
-                            num_channels[branch_index], stride, downsample))
-        self.num_inchannels[branch_index] = \
-            num_channels[branch_index] * block.expansion
-        for i in range(1, num_blocks[branch_index]):
-            layers.append(block(self.num_inchannels[branch_index],
-                                num_channels[branch_index]))
-
-        return nn.Sequential(*layers)
-
-    def _make_branches(self, num_branches, block, num_blocks, num_channels):
-        branches = []
-
-        for i in range(num_branches):
-            branches.append(
-                self._make_one_branch(i, block, num_blocks, num_channels))
-
-        return nn.ModuleList(branches)
-
-    def _make_fuse_layers(self):
-        if self.num_branches == 1:
-            return None
-
-        num_branches = self.num_branches
-        num_inchannels = self.num_inchannels
-        fuse_layers = []
-        for i in range(num_branches if self.multi_scale_output else 1):
-            fuse_layer = []
-            for j in range(num_branches):
-                if j > i:
-                    fuse_layer.append(nn.Sequential(
-                        nn.Conv2d(num_inchannels[j],
-                                  num_inchannels[i],
-                                  1,
-                                  1,
-                                  0,
-                                  bias=False),
-                        nn.BatchNorm2d(num_inchannels[i], 
-                                       momentum=BN_MOMENTUM),
-                        nn.Upsample(scale_factor=2**(j-i), mode='nearest')))
-                elif j == i:
-                    fuse_layer.append(None)
-                else:
-                    conv3x3s = []
-                    for k in range(i-j):
-                        if k == i - j - 1:
-                            num_outchannels_conv3x3 = num_inchannels[i]
-                            conv3x3s.append(nn.Sequential(
-                                nn.Conv2d(num_inchannels[j],
-                                          num_outchannels_conv3x3,
-                                          3, 2, 1, bias=False),
-                                nn.BatchNorm2d(num_outchannels_conv3x3, 
-                                            momentum=BN_MOMENTUM)))
-                        else:
-                            num_outchannels_conv3x3 = num_inchannels[j]
-                            conv3x3s.append(nn.Sequential(
-                                nn.Conv2d(num_inchannels[j],
-                                          num_outchannels_conv3x3,
-                                          3, 2, 1, bias=False),
-                                nn.BatchNorm2d(num_outchannels_conv3x3,
-                                            momentum=BN_MOMENTUM),
-                                nn.ReLU(False)))
-                    fuse_layer.append(nn.Sequential(*conv3x3s))
-            fuse_layers.append(nn.ModuleList(fuse_layer))
-
-        return nn.ModuleList(fuse_layers)
-
-    def get_num_inchannels(self):
-        return self.num_inchannels
-
-    def forward(self, x):
-        if self.num_branches == 1:
-            return [self.branches[0](x[0])]
-
-        for i in range(self.num_branches):
-            x[i] = self.branches[i](x[i])
-
-        x_fuse = []
-        for i in range(len(self.fuse_layers)):
-            y = x[0] if i == 0 else self.fuse_layers[i][0](x[0])
-            for j in range(1, self.num_branches):
-                if i == j:
-                    y = y + x[j]
-                else:
-                    y = y + self.fuse_layers[i][j](x[j])
-            x_fuse.append(self.relu(y))
-
-        return x_fuse
-
-
-blocks_dict = {
-    'BASIC': BasicBlock,
-    'BOTTLENECK': Bottleneck
-}
-
-
-class HRNetV2(nn.Module):
-
-    cfg = {
-    'MODEL': {
-        'NAME': 'cls_hrnet',
-        'IMAGE_SIZE': [224, 224],
-        'EXTRA': {
-            'STAGE1': {
-                'NUM_MODULES': 1,
-                'NUM_RANCHES': 1,
-                'BLOCK': 'BOTTLENECK',
-                'NUM_BLOCKS': [4],
-                'NUM_CHANNELS': [64],
-                'FUSE_METHOD': 'SUM'
-            },
-            'STAGE2': {
-                'NUM_MODULES': 1,
-                'NUM_BRANCHES': 2,
-                'BLOCK': 'BASIC',
-                'NUM_BLOCKS': [4, 4],
-                'NUM_CHANNELS': [48, 96],
-                'FUSE_METHOD': 'SUM'
-            },
-            'STAGE3': {
-                'NUM_MODULES': 4,
-                'NUM_BRANCHES': 3,
-                'BLOCK': 'BASIC',
-                'NUM_BLOCKS': [4, 4, 4],
-                'NUM_CHANNELS': [48, 96, 192],
-                'FUSE_METHOD': 'SUM'
-            },
-            'STAGE4': {
-                'NUM_MODULES': 3,
-                'NUM_BRANCHES': 4,
-                'BLOCK': 'BASIC',
-                'NUM_BLOCKS': [4, 4, 4, 4],
-                'NUM_CHANNELS': [48, 96, 192, 384],
-                'FUSE_METHOD': 'SUM'
-                }
-            }
-        }
-    }
-
-    def __init__(self, **kwargs):
-        super(HRNetV2, self).__init__()
-
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=2, padding=1,
-                               bias=False)
-        self.bn1 = nn.BatchNorm2d(64, momentum=BN_MOMENTUM)
-        self.conv2 = nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1,
-                               bias=False)
-        self.bn2 = nn.BatchNorm2d(64, momentum=BN_MOMENTUM)
-        self.relu = nn.ReLU(inplace=True)
-
-        self.stage1_cfg = self.cfg['MODEL']['EXTRA']['STAGE1']
-        num_channels = self.stage1_cfg['NUM_CHANNELS'][0]
-        block = blocks_dict[self.stage1_cfg['BLOCK']]
-        num_blocks = self.stage1_cfg['NUM_BLOCKS'][0]
-        self.layer1 = self._make_layer(block, 64, num_channels, num_blocks)
-        stage1_out_channel = block.expansion*num_channels
-
-        self.stage2_cfg = self.cfg['MODEL']['EXTRA']['STAGE2']
-        num_channels = self.stage2_cfg['NUM_CHANNELS']
-        block = blocks_dict[self.stage2_cfg['BLOCK']]
-        num_channels = [
-            num_channels[i] * block.expansion for i in range(len(num_channels))]
-        self.transition1 = self._make_transition_layer(
-            [stage1_out_channel], num_channels)
-        self.stage2, pre_stage_channels = self._make_stage(
-            self.stage2_cfg, num_channels)
-
-        self.stage3_cfg = self.cfg['MODEL']['EXTRA']['STAGE3']
-        num_channels = self.stage3_cfg['NUM_CHANNELS']
-        block = blocks_dict[self.stage3_cfg['BLOCK']]
-        num_channels = [
-            num_channels[i] * block.expansion for i in range(len(num_channels))]
-        self.transition2 = self._make_transition_layer(
-            pre_stage_channels, num_channels)
-        self.stage3, pre_stage_channels = self._make_stage(
-            self.stage3_cfg, num_channels)
-
-        self.stage4_cfg = self.cfg['MODEL']['EXTRA']['STAGE4']
-        num_channels = self.stage4_cfg['NUM_CHANNELS']
-        block = blocks_dict[self.stage4_cfg['BLOCK']]
-        num_channels = [
-            num_channels[i] * block.expansion for i in range(len(num_channels))]
-        self.transition3 = self._make_transition_layer(
-            pre_stage_channels, num_channels)
-        self.stage4, pre_stage_channels = self._make_stage(
-            self.stage4_cfg, num_channels, multi_scale_output=True)
-
-        # Classification Head
-        self.incre_modules, self.downsamp_modules, \
-            self.final_layer = self._make_head(pre_stage_channels)
-
-        self.classifier = nn.Linear(2048, 1000)
-
-    def _make_head(self, pre_stage_channels):
-        head_block = Bottleneck
-        head_channels = [32, 64, 128, 256]
-
-        # Increasing the #channels on each resolution 
-        # from C, 2C, 4C, 8C to 128, 256, 512, 1024
-        incre_modules = []
-        for i, channels  in enumerate(pre_stage_channels):
-            incre_module = self._make_layer(head_block,
-                                            channels,
-                                            head_channels[i],
-                                            1,
-                                            stride=1)
-            incre_modules.append(incre_module)
-        incre_modules = nn.ModuleList(incre_modules)
-            
-        # downsampling modules
-        downsamp_modules = []
-        for i in range(len(pre_stage_channels)-1):
-            in_channels = head_channels[i] * head_block.expansion
-            out_channels = head_channels[i+1] * head_block.expansion
-
-            downsamp_module = nn.Sequential(
-                nn.Conv2d(in_channels=in_channels,
-                          out_channels=out_channels,
-                          kernel_size=3,
-                          stride=2,
-                          padding=1),
-                nn.BatchNorm2d(out_channels, momentum=BN_MOMENTUM),
-                nn.ReLU(inplace=True)
-            )
-
-            downsamp_modules.append(downsamp_module)
-        downsamp_modules = nn.ModuleList(downsamp_modules)
-
-        final_layer = nn.Sequential(
-            nn.Conv2d(
-                in_channels=head_channels[3] * head_block.expansion,
-                out_channels=2048,
-                kernel_size=1,
-                stride=1,
-                padding=0
-            ),
-            nn.BatchNorm2d(2048, momentum=BN_MOMENTUM),
-            nn.ReLU(inplace=True)
+        self.first = nn.Sequential(
+            CBR2d(64, 64, kernel_size=1, stride=1, bias=False), 
+            CBR2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False), 
+            CBR2d(64, 256, kernel_size=1, stride=1, bias=False)
         )
 
-        return incre_modules, downsamp_modules, final_layer
+    def forward(self, x):
+        out = self.first(x)
 
-    def _make_transition_layer(
-            self, num_channels_pre_layer, num_channels_cur_layer):
-        num_branches_cur = len(num_channels_cur_layer)
-        num_branches_pre = len(num_channels_pre_layer)
+        out = self.block1(out)
+        out = self.block2(out)
+        out = self.block3(out)
 
-        transition_layers = []
-        for i in range(num_branches_cur):
-            if i < num_branches_pre:
-                if num_channels_cur_layer[i] != num_channels_pre_layer[i]:
-                    transition_layers.append(nn.Sequential(
-                        nn.Conv2d(num_channels_pre_layer[i],
-                                  num_channels_cur_layer[i],
-                                  3,
-                                  1,
-                                  1,
-                                  bias=False),
-                        nn.BatchNorm2d(
-                            num_channels_cur_layer[i], momentum=BN_MOMENTUM),
-                        nn.ReLU(inplace=True)))
-                else:
-                    transition_layers.append(None)
-            else:
-                conv3x3s = []
-                for j in range(i+1-num_branches_pre):
-                    inchannels = num_channels_pre_layer[-1]
-                    outchannels = num_channels_cur_layer[i] \
-                        if j == i-num_branches_pre else inchannels
-                    conv3x3s.append(nn.Sequential(
-                        nn.Conv2d(
-                            inchannels, outchannels, 3, 2, 1, bias=False),
-                        nn.BatchNorm2d(outchannels, momentum=BN_MOMENTUM),
-                        nn.ReLU(inplace=True)))
-                transition_layers.append(nn.Sequential(*conv3x3s))
+        return out
 
-        return nn.ModuleList(transition_layers)
+# Stem network
+class StemNet(nn.Module):
+    def __init__(self):
+        super(StemNet, self).__init__()
 
-    def _make_layer(self, block, inplanes, planes, blocks, stride=1):
-        downsample = None
-        if stride != 1 or inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                nn.Conv2d(inplanes, planes * block.expansion,
-                          kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(planes * block.expansion, momentum=BN_MOMENTUM),
-            )
-
-        layers = []
-        layers.append(block(inplanes, planes, stride, downsample))
-        inplanes = planes * block.expansion
-        for i in range(1, blocks):
-            layers.append(block(inplanes, planes))
-
-        return nn.Sequential(*layers)
-
-    def _make_stage(self, layer_config, num_inchannels,
-                    multi_scale_output=True):
-        num_modules = layer_config['NUM_MODULES']
-        num_branches = layer_config['NUM_BRANCHES']
-        num_blocks = layer_config['NUM_BLOCKS']
-        num_channels = layer_config['NUM_CHANNELS']
-        block = blocks_dict[layer_config['BLOCK']]
-        fuse_method = layer_config['FUSE_METHOD']
-
-        modules = []
-        for i in range(num_modules):
-            # multi_scale_output is only used last module
-            if not multi_scale_output and i == num_modules - 1:
-                reset_multi_scale_output = False
-            else:
-                reset_multi_scale_output = True
-
-            modules.append(
-                HighResolutionModule(num_branches,
-                                      block,
-                                      num_blocks,
-                                      num_inchannels,
-                                      num_channels,
-                                      fuse_method,
-                                      reset_multi_scale_output)
-            )
-            num_inchannels = modules[-1].get_num_inchannels()
-
-        return nn.Sequential(*modules), num_inchannels
+        self.block = ConvLayer2d(3, 64, kernel_size=3, stride=2, padding=1, bias=False)
 
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.conv2(x)
-        x = self.bn2(x)
-        x = self.relu(x)
-        x = self.layer1(x)
+        return self.block(x)
 
-        x_list = []
-        for i in range(self.stage2_cfg['NUM_BRANCHES']):
-            if self.transition1[i] is not None:
-                x_list.append(self.transition1[i](x))
-            else:
-                x_list.append(x)
-        y_list = self.stage2(x_list)
+# High(HI) - Medium(MD) - Small(SM) - Tiny(TN)
+def high_to_medium():
+    return nn.Sequential(
+        nn.Conv2d(48, 96, kernel_size=3, stride=2, padding=1, bias=False), 
+        nn.BatchNorm2d(96)
+    )
 
-        x_list = []
-        for i in range(self.stage3_cfg['NUM_BRANCHES']):
-            if self.transition2[i] is not None:
-                x_list.append(self.transition2[i](y_list[-1]))
-            else:
-                x_list.append(y_list[i])
-        y_list = self.stage3(x_list)
+def medium_to_high():
+    return nn.Sequential(
+        nn.Conv2d(96, 48, kernel_size=1, bias=False), 
+        nn.BatchNorm2d(48)
+    )
 
-        x_list = []
-        for i in range(self.stage4_cfg['NUM_BRANCHES']):
-            if self.transition3[i] is not None:
-                x_list.append(self.transition3[i](y_list[-1]))
-            else:
-                x_list.append(y_list[i])
-        y_list = self.stage4(x_list)
+def medium_to_small():
+    return nn.Sequential(
+        nn.Conv2d(96, 192, kernel_size=3, stride=2, padding=1, bias=False), 
+        nn.BatchNorm2d(192)
+    )
 
-        # Classification Head
-        y = self.incre_modules[0](y_list[0])
-        for i in range(len(self.downsamp_modules)):
-            y = self.incre_modules[i+1](y_list[i+1]) + \
-                        self.downsamp_modules[i](y)
+def small_to_medium():
+    return nn.Sequential(
+        nn.Conv2d(192, 96, kernel_size=1, bias=False), 
+        nn.BatchNorm2d(96)
+    )
 
-        y = self.final_layer(y)
+def small_to_tiny():
+    return nn.Sequential(
+        nn.Conv2d(192, 384, kernel_size=3, stride=2, padding=1, bias=False), 
+        nn.BatchNorm2d(384)
+    )
 
-        if torch._C._get_tracing_state():
-            y = y.flatten(start_dim=2).mean(dim=2)
-        else:
-            y = F.avg_pool2d(y, kernel_size=y.size()
-                                 [2:]).view(y.size(0), -1)
+def tiny_to_small():
+    return nn.Sequential(
+        nn.Conv2d(384, 192, kernel_size=1, bias=False), 
+        nn.BatchNorm2d(192)
+    )
 
-        y = self.classifier(y)
+# For Stage
+class Stage01StreamGenerateBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+        self.h_res_block = CBR2d(256, 48, kernel_size=3, padding=1, bias=False)
+        self.m_res_block = CBR2d(256, 96, kernel_size=3, stride=2, padding=1, bias=False)
 
-        return y
+    def forward(self, inputs):
+        out_h = self.h_res_block(inputs)
+        out_m = self.m_res_block(inputs)
 
-    def init_weights(self, pretrained='',):
-        logger.info('=> init weights from normal distribution')
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(
-                    m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-        if os.path.isfile(pretrained):
-            pretrained_dict = torch.load(pretrained)
-            logger.info('=> loading pretrained model {}'.format(pretrained))
-            model_dict = self.state_dict()
-            pretrained_dict = {k: v for k, v in pretrained_dict.items()
-                               if k in model_dict.keys()}
-            for k, _ in pretrained_dict.items():
-                logger.info(
-                    '=> loading {} pretrained model {}'.format(k, pretrained))
-            model_dict.update(pretrained_dict)
-            self.load_state_dict(model_dict)
+        return out_h, out_m
 
+class Stage02Fusion(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.high_to_medium = high_to_medium()
+        
+        self.medium_to_high = medium_to_high()
+        
+        self.medium_to_small1 = medium_to_small()
+        self.medium_to_small2 = medium_to_small()
 
+        self.relu = nn.ReLU()
+
+    def forward(self, inputs_high, inputs_medium):
+        high_size = (inputs_high.shape[-1], inputs_high.shape[-2])
+
+        high2med = self.high_to_medium(inputs_high)
+        high2small = self.medium_to_small1(high2med)
+
+        med2high = self.medium_to_high(inputs_medium)
+        med2high = F.interpolate(med2high, size = high_size, mode = "bilinear", align_corners=True)
+
+        med2small = self.medium_to_small2(inputs_medium)
+
+        out_high = inputs_high + med2high
+        out_med = inputs_medium + high2med
+        out_small = med2small + high2small
+
+        out_high = self.relu(out_high)
+        out_med = self.relu(out_med)
+        out_small = self.relu(out_small)
+
+        return out_high, out_med, out_small
+    
+class Stage03Reinforce(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.high_to_medium = high_to_medium()
+        
+        self.medium_to_high1 = medium_to_high()
+        self.medium_to_high2 = medium_to_high()
+        
+        self.medium_to_small1 = medium_to_small()
+        self.medium_to_small2 = medium_to_small()
+
+        self.small_to_medium = small_to_medium()
+
+        self.relu = nn.ReLU()
+
+    def forward(self, inputs_high, inputs_medium, inputs_small):
+        high_size = (inputs_high.shape[-1], inputs_high.shape[-2])
+        med_size = (inputs_medium.shape[-1], inputs_medium.shape[-2])
+
+        med2high = self.medium_to_high1(inputs_medium)
+        med2high = F.interpolate(med2high, size = high_size, mode = "bilinear", align_corners=True)
+
+        small2med = self.small_to_medium(inputs_small)
+        small2med = F.interpolate(small2med, size = med_size, mode = "bilinear", align_corners=True)
+
+        small2high = self.medium_to_high2(small2med)
+        small2high = F.interpolate(small2high, size = high_size, mode = "bilinear", align_corners=True)
+
+        high2med = self.high_to_medium(inputs_high)
+        med2small = self.medium_to_small1(inputs_medium)
+        high2med2small = self.medium_to_small2(high2med)
+
+        out_high = inputs_high + med2high + small2high
+        out_med = inputs_medium + high2med + small2med
+        out_small = med2small + high2med2small + inputs_small
+
+        out_high = self.relu(out_high)
+        out_med = self.relu(out_med)
+        out_small = self.relu(out_small)
+
+        return out_high, out_med, out_small
+    
+class Stage03Fusion(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.high_to_medium = high_to_medium()
+        
+        self.medium_to_high1 = medium_to_high()
+        self.medium_to_high2 = medium_to_high()
+
+        self.medium_to_small1 = medium_to_small()
+        self.medium_to_small2 = medium_to_small()
+        
+        self.small_to_medium = small_to_medium()
+        
+        self.small_to_tiny1 = small_to_tiny()
+        self.small_to_tiny2 = small_to_tiny()
+        self.small_to_tiny3 = small_to_tiny()
+
+        self.relu = nn.ReLU()
+
+    def forward(self, inputs_high, inputs_medium, inputs_small):
+        high_size = (inputs_high.shape[-1], inputs_high.shape[-2])
+        med_size = (inputs_medium.shape[-1], inputs_medium.shape[-2])
+
+        med2high = self.medium_to_high1(inputs_medium)
+        med2high = F.interpolate(
+            med2high, size = high_size, mode = "bilinear", align_corners=True
+        )
+        small2med = self.small_to_medium(inputs_small)
+        small2med = F.interpolate(
+            small2med, size = med_size, mode = "bilinear", align_corners=True
+        )
+
+        small2med2high = self.medium_to_high2(small2med)
+        small2med2high = F.interpolate(
+            small2med2high, size = high_size, mode = "bilinear", align_corners=True
+        )
+
+        high2med = self.high_to_medium(inputs_high)
+        med2small = self.medium_to_small1(inputs_medium)
+        high2med2small = self.medium_to_small2(high2med)
+
+        high2tiny = self.small_to_tiny1(high2med2small)
+        med2tiny = self.small_to_tiny2(med2small)
+        small2tiny = self.small_to_tiny3(inputs_small)
+
+        out_high = inputs_high + med2high + small2med2high
+        out_med = inputs_medium + high2med + small2med
+        out_small = med2small + high2med2small + inputs_small
+        out_tiny = high2tiny + med2tiny + small2tiny
+
+        out_high = self.relu(out_high)
+        out_med = self.relu(out_med)
+        out_small = self.relu(out_small)
+        out_tiny = self.relu(out_tiny)
+
+        return out_high, out_med, out_small, out_tiny
+    
+class Stage04Reinforce(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.high_to_medium = high_to_medium()
+
+        self.medium_to_high1 = medium_to_high()
+        self.medium_to_high2 = medium_to_high()
+        self.medium_to_high3 = medium_to_high()
+
+        self.medium_to_small1 = medium_to_small()
+        self.medium_to_small2 = medium_to_small()
+
+        self.small_to_medium1 = small_to_medium()
+        self.small_to_medium2 = small_to_medium()
+
+        self.small_to_tiny1 = small_to_tiny()
+        self.small_to_tiny2 = small_to_tiny()
+        self.small_to_tiny3 = small_to_tiny()
+
+        self.tiny_to_small = tiny_to_small()
+
+        self.relu = nn.ReLU()
+
+    def forward(self, inputs_high, inputs_medium, inputs_small, inputs_tiny):
+        high_size = (inputs_high.shape[-1], inputs_high.shape[-2])
+        med_size = (inputs_medium.shape[-1], inputs_medium.shape[-2])
+        small_size = (inputs_small.shape[-1], inputs_small.shape[-2])
+
+        med2high = self.medium_to_high1(inputs_medium)
+        med2high = F.interpolate(
+            med2high, size = high_size, mode = "bilinear", align_corners=True
+        )
+        small2med = self.small_to_medium1(inputs_small)
+        small2med = F.interpolate(
+            small2med, size = med_size, mode = "bilinear", align_corners=True
+        )
+        tiny2small = self.tiny_to_small(inputs_tiny)
+        tiny2small = F.interpolate(
+            tiny2small, size = small_size, mode = "bilinear", align_corners=True
+        )
+
+        small2med2high = self.medium_to_high2(small2med)
+        small2med2high = F.interpolate(
+            small2med2high, size = high_size, mode = "bilinear", align_corners=True
+        )
+
+        tiny2med = self.small_to_medium2(tiny2small)
+        tiny2med = F.interpolate(
+            tiny2med, size = med_size, mode = "bilinear", align_corners=True
+        )
+        tiny2high = self.medium_to_high3(tiny2med)
+        tiny2high = F.interpolate(
+            tiny2high, size = high_size, mode = "bilinear", align_corners=True
+        )
+
+        high2med = self.high_to_medium(inputs_high)
+        med2small = self.medium_to_small1(inputs_medium)
+        high2med2small = self.medium_to_small2(high2med)
+        high2tiny = self.small_to_tiny1(high2med2small)
+        med2tiny = self.small_to_tiny2(med2small)
+        small2tiny = self.small_to_tiny3(inputs_small)
+
+        out_high = inputs_high + med2high + small2med2high + tiny2high
+        out_med = inputs_medium + high2med + small2med + tiny2med
+        out_small = med2small + high2med2small + inputs_small + tiny2small
+        out_tiny = high2tiny + med2tiny + small2tiny + inputs_tiny
+
+        out_high = self.relu(out_high)
+        out_med = self.relu(out_med)
+        out_small = self.relu(out_small)
+        out_tiny = self.relu(out_tiny)
+
+        return out_high, out_med, out_small, out_tiny
+
+class LastBlock(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        total_channel = 48+96+192+384
+        self.block = nn.Sequential(
+            CBR2d(total_channel, total_channel, kernel_size=1, bias=False), 
+            nn.Conv2d(total_channel, num_classes, kernel_size=1, bias=False)
+        )
+
+    def forward(self, inputs_high, inputs_med, inputs_small, inputs_tiny):
+        high_size = (inputs_high.shape[-1], inputs_high.shape[-2])
+        origin_size = (high_size[0]*4, high_size[1]*4)
+
+        med2high = F.interpolate(inputs_med, size = high_size, mode="bilinear", align_corners=True)
+        small2high = F.interpolate(inputs_small, size = high_size, mode="bilinear", align_corners=True)
+        tiny2high = F.interpolate(inputs_tiny, size = high_size, mode="bilinear", align_corners=True)
+
+        out = torch.cat([inputs_high, med2high, small2high, tiny2high], dim=1)
+        out = self.block(out)
+
+        out = F.interpolate(out, size=origin_size, mode = "bilinear", align_corners=True)
+
+        return out
+
+class Stage03Block(nn.Module):
+    def __init__(self):
+        super(Stage03Block, self).__init__()
+
+        self.highbasic = BasicBlock(48)
+        self.medbasic = BasicBlock(96)
+        self.smallbasic = BasicBlock(192)
+
+        self.reinforce = Stage03Reinforce()
+ 
+    def forward(self, high, med, small): 
+        
+        high = self.highbasic(high)
+        med = self.medbasic(med)        
+        small = self.smallbasic(small)
+
+        return self.reinforce(high, med, small)
+
+class Stage04Block(nn.Module):
+    def __init__(self):
+        super(Stage04Block, self).__init__()
+
+        self.highbasic = BasicBlock(48)
+        self.medbasic = BasicBlock(96)
+        self.smallbasic = BasicBlock(192)
+        self.tinybasic = BasicBlock(384)
+
+        self.reinforce = Stage04Reinforce()
+ 
+    def forward(self, high, med, small, tiny): 
+        
+        high = self.highbasic(high)
+        med = self.medbasic(med)        
+        small = self.smallbasic(small)
+        tiny = self.tinybasic(tiny)
+
+        return self.reinforce(high, med, small, tiny)
+
+# HRNet Segmentation Model
+class HRNetV2(nn.Module):
+    def __init__(self, num_classes):
+        super(HRNetV2, self).__init__()
+        self.stem_net = StemNet()
+
+        self.bottle = BottleneckBlock()
+
+        self.highbasic2 = BasicBlock(48)
+        self.medbasic2 = BasicBlock(96)
+
+        self.highbasic3 = BasicBlock(48)
+        self.medbasic3 = BasicBlock(96)
+        self.smallbasic3 = BasicBlock(192)
+
+        self.firstGenBlock = Stage01StreamGenerateBlock()
+
+        self.secondFusion = Stage02Fusion()
+
+        self.thirdBlock1 = Stage03Block()
+        self.thirdBlock2 = Stage03Block()
+        self.thirdBlock3 = Stage03Block()
+
+        self.thirdFusion = Stage03Fusion()
+
+        self.fourthBlock1 = Stage04Block()
+        self.fourthBlock2 = Stage04Block()
+        self.fourthBlock3 = Stage04Block()
+
+        self.lastBlock = LastBlock(num_classes)
+
+    def forward(self, x):
+        out = self.stem_net(x)
+        #stage 1
+        out = self.bottle(out)
+        high, med = self.firstGenBlock(out)
+        #stage 2
+        high = self.highbasic2(high)
+        med = self.medbasic2(med)
+
+        high, med, small = self.secondFusion(high, med)
+
+        #stage 3
+        high, med, small = self.thirdBlock1(high, med, small)
+        high, med, small = self.thirdBlock2(high, med, small)
+        high, med, small = self.thirdBlock3(high, med, small)
+
+        high = self.highbasic3(high)
+        med = self.medbasic3(med)        
+        small = self.smallbasic3(small)
+
+        high, med, small, tiny = self.thirdFusion(high, med, small)
+
+        #stage 4
+        high, med, small, tiny = self.fourthBlock1(high, med, small, tiny)
+        high, med, small, tiny = self.fourthBlock2(high, med, small, tiny)
+        high, med, small, tiny = self.fourthBlock3(high, med, small, tiny)
+
+        x = self.lastBlock(high, med, small, tiny)
+        
+        return x
